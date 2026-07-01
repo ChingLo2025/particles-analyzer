@@ -1,5 +1,9 @@
-import { ChangeEvent, PointerEvent, useEffect, useMemo, useRef, useState, WheelEvent } from 'react';
+import { ChangeEvent, PointerEvent, ReactNode, useEffect, useMemo, useRef, useState, WheelEvent } from 'react';
 import {
+  AlertCircle,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Download,
   FileDown,
   ImageUp,
@@ -15,7 +19,19 @@ import {
 import { downloadCSV, downloadOverlayPNG } from './exporters';
 import { analyzeImage } from './opencv';
 import { useAnalyzerStore } from './store';
-import type { DisplayMode, Particle, Point, ROI, SortKey, ToolMode, Unit } from './types';
+import type {
+  DiameterStats,
+  DisplayMode,
+  HistogramBin,
+  Particle,
+  Point,
+  ROI,
+  SortKey,
+  StepStatus,
+  ToolMode,
+  Unit,
+  WorkflowStep,
+} from './types';
 
 const displayModes: Array<{ id: DisplayMode; label: string }> = [
   { id: 'original', label: '原圖' },
@@ -31,6 +47,28 @@ const toolModes: Array<{ id: ToolMode; label: string; icon: typeof MousePointer2
 ];
 
 const units: Unit[] = ['nm', 'µm', 'mm'];
+
+const workflowSteps: Array<{ id: WorkflowStep; label: string }> = [
+  { id: 'upload', label: '上傳影像' },
+  { id: 'calibration', label: '比例尺校正' },
+  { id: 'roi', label: 'ROI 抓取' },
+  { id: 'processing', label: '影像處理' },
+  { id: 'detection', label: '粒子辨識' },
+  { id: 'review', label: '手動刪除' },
+];
+
+const helpText = {
+  actualLength: '輸入你在影像上拖出的比例尺實際長度。數值越高，每個 pixel 換算出的實際尺寸越大；數值越低，量測結果會等比例變小。',
+  unit: '選擇比例尺標示的單位，會套用到所有實際面積、實際粒徑與 histogram。單位選錯時，數值大小不會自動換算。',
+  threshold: '決定哪些像素被視為粒子。數值越高，亮粒子模式會保留更亮的區域、通常粒子變少；數值越低會納入更多區域，也更容易吃進背景雜訊。',
+  polarity: '選擇粒子相對背景是偏亮或偏暗。選錯時，threshold 會抓到背景而不是粒子，辨識結果通常會大量錯誤。',
+  blur: '分析前先平滑影像。數值越高越能降低雜訊，但小粒子邊界會被抹平；數值越低保留細節，但雜訊也更容易被誤判成粒子。',
+  opening: '先侵蝕再膨脹，用來移除小雜點。數值越高越能清掉孤立噪點，但小粒子也可能被刪掉；數值越低較保留小特徵。',
+  closing: '先膨脹再侵蝕，用來補洞與連接斷裂邊界。數值越高輪廓更完整，但靠近的粒子可能被黏在一起；數值越低較不會合併粒子。',
+  showExcluded: '控制畫面是否顯示已排除粒子。開啟方便檢查刪除紀錄；關閉則讓有效粒子與統計分布更清楚。',
+  overlayOpacity: '調整邊界標記疊在原圖上的透明度。數值越高標記越明顯；數值越低越容易檢查原始影像細節。',
+  binWidth: '控制 histogram 每一格代表的粒徑寬度。寬度越大分布越平滑但細節較少；寬度越小解析度較高，但分布可能變得零碎。',
+};
 
 const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
 
@@ -54,6 +92,27 @@ const pointInPolygon = (point: Point, polygon: Point[]) => {
   return inside;
 };
 
+type ParticleWithActualDiameter = Particle & { equivalentDiameterActual: number };
+
+const formatNumber = (value: number) => {
+  const abs = Math.abs(value);
+  if (abs >= 100) return value.toFixed(1);
+  if (abs >= 10) return value.toFixed(2);
+  if (abs >= 1) return value.toFixed(3);
+  return value.toPrecision(3);
+};
+
+const formatActual = (value: number | null, unit: Unit) => (value === null ? '--' : `${formatNumber(value)} ${unit}`);
+
+const niceBinWidth = (range: number) => {
+  if (!Number.isFinite(range) || range <= 0) return 1;
+  const rough = range / 12;
+  const exponent = Math.floor(Math.log10(rough));
+  const fraction = rough / 10 ** exponent;
+  const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+  return niceFraction * 10 ** exponent;
+};
+
 export const App = () => {
   const {
     image,
@@ -72,9 +131,14 @@ export const App = () => {
     sortDirection,
     undoStack,
     redoStack,
+    currentStep,
+    completedSteps,
+    stepWarnings,
     setImage,
     setDisplayMode,
     setToolMode,
+    goToStep,
+    completeStep,
     setROI,
     setCalibration,
     setSettings,
@@ -96,6 +160,9 @@ export const App = () => {
   const [actualLength, setActualLength] = useState('1');
   const [unit, setUnit] = useState<Unit>('µm');
   const [status, setStatus] = useState('請上傳 SEM 影像開始分析。');
+  const [histogramBinWidthActual, setHistogramBinWidthActual] = useState(0);
+  const [hoveredBinId, setHoveredBinId] = useState<string | null>(null);
+  const [highlightedParticleIds, setHighlightedParticleIds] = useState<number[]>([]);
 
   const visibleImageUrl = useMemo(() => {
     if (displayMode === 'mask') return maskDataUrl ?? image?.url ?? '';
@@ -114,11 +181,186 @@ export const App = () => {
 
   const summary = useMemo(() => {
     const valid = particles.filter((particle) => !particle.excluded);
-    const mean = valid.length
-      ? valid.reduce((total, particle) => total + particle.equivalentDiameterPx, 0) / valid.length
-      : 0;
-    return { total: particles.length, valid: valid.length, mean };
+    return { total: particles.length, valid: valid.length };
   }, [particles]);
+
+  const excludedCount = particles.length - summary.valid;
+
+  const validDiameterParticles = useMemo(
+    () =>
+      particles.filter(
+        (particle): particle is ParticleWithActualDiameter =>
+          !particle.excluded &&
+          particle.equivalentDiameterActual !== null &&
+          Number.isFinite(particle.equivalentDiameterActual),
+      ),
+    [particles],
+  );
+
+  const diameterStats = useMemo<DiameterStats>(() => {
+    if (!validDiameterParticles.length) {
+      return {
+        count: 0,
+        min: null,
+        max: null,
+        range: null,
+        mean: null,
+        standardDeviation: null,
+        unit: calibration.unit,
+      };
+    }
+
+    const values = validDiameterParticles.map((particle) => particle.equivalentDiameterActual);
+    const count = values.length;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const mean = values.reduce((total, value) => total + value, 0) / count;
+    const variance =
+      count > 1 ? values.reduce((total, value) => total + (value - mean) ** 2, 0) / (count - 1) : null;
+
+    return {
+      count,
+      min,
+      max,
+      range: max - min,
+      mean,
+      standardDeviation: variance === null ? null : Math.sqrt(variance),
+      unit: calibration.unit,
+    };
+  }, [calibration.unit, validDiameterParticles]);
+
+  const binWidthBounds = useMemo(() => {
+    const range = diameterStats.range ?? 0;
+    const fallback = diameterStats.max ?? 1;
+    const span = range > 0 ? range : Math.max(fallback, 1);
+    const min = span / 50;
+    const max = span;
+    const step = Math.max(span / 500, min / 10);
+    const auto = Math.min(max, Math.max(min, niceBinWidth(span)));
+    return { min, max, step, auto };
+  }, [diameterStats.max, diameterStats.range]);
+
+  const activeBinWidth = histogramBinWidthActual > 0 ? histogramBinWidthActual : binWidthBounds.auto;
+
+  const histogramBins = useMemo<HistogramBin[]>(() => {
+    if (!validDiameterParticles.length || diameterStats.min === null || diameterStats.max === null || activeBinWidth <= 0) {
+      return [];
+    }
+
+    if (diameterStats.min === diameterStats.max) {
+      const halfWidth = activeBinWidth / 2;
+      return [
+        {
+          id: 'bin-0',
+          start: Math.max(0, diameterStats.min - halfWidth),
+          end: diameterStats.max + halfWidth,
+          count: validDiameterParticles.length,
+          percentage: 100,
+          particleIds: validDiameterParticles.map((particle) => particle.id),
+        },
+      ];
+    }
+
+    const binCount = Math.max(1, Math.ceil((diameterStats.max - diameterStats.min) / activeBinWidth));
+    const bins: HistogramBin[] = Array.from({ length: binCount }, (_, index) => ({
+      id: `bin-${index}`,
+      start: diameterStats.min! + index * activeBinWidth,
+      end: diameterStats.min! + (index + 1) * activeBinWidth,
+      count: 0,
+      percentage: 0,
+      particleIds: [],
+    }));
+
+    validDiameterParticles.forEach((particle) => {
+      const index = Math.min(
+        binCount - 1,
+        Math.max(0, Math.floor((particle.equivalentDiameterActual - diameterStats.min!) / activeBinWidth)),
+      );
+      bins[index].count += 1;
+      bins[index].particleIds.push(particle.id);
+    });
+
+    return bins.map((bin, index) => ({
+      ...bin,
+      end: index === bins.length - 1 ? diameterStats.max! : bin.end,
+      percentage: diameterStats.count ? (bin.count / diameterStats.count) * 100 : 0,
+    }));
+  }, [activeBinWidth, diameterStats.count, diameterStats.max, diameterStats.min, validDiameterParticles]);
+
+  const hoveredBin = histogramBins.find((bin) => bin.id === hoveredBinId) ?? null;
+  const highlightedParticleIdSet = useMemo(() => new Set(highlightedParticleIds), [highlightedParticleIds]);
+  const maxBinCount = Math.max(1, ...histogramBins.map((bin) => bin.count));
+
+  useEffect(() => {
+    if (!diameterStats.count) {
+      setHistogramBinWidthActual(0);
+      return;
+    }
+    setHistogramBinWidthActual((current) =>
+      current >= binWidthBounds.min && current <= binWidthBounds.max ? current : binWidthBounds.auto,
+    );
+  }, [binWidthBounds.auto, binWidthBounds.max, binWidthBounds.min, diameterStats.count]);
+
+  useEffect(() => {
+    setHighlightedParticleIds([]);
+  }, [histogramBinWidthActual, particles]);
+
+  const toggleHistogramBin = (bin: HistogramBin) => {
+    if (!bin.count) return;
+    const nextIds = bin.particleIds;
+    const isSameSelection =
+      highlightedParticleIds.length === nextIds.length && nextIds.every((id) => highlightedParticleIdSet.has(id));
+    setHighlightedParticleIds(isSameSelection ? [] : nextIds);
+    setSelectedParticleId(null);
+  };
+
+  const canEnterStep = (step: WorkflowStep) => {
+    if (step === 'upload') return true;
+    if (step === 'calibration') return Boolean(imageElement);
+    if (step === 'roi') return Boolean(imageElement && calibration.pixelSize);
+    if (step === 'processing') return Boolean(imageElement && calibration.pixelSize && roi);
+    if (step === 'detection') return Boolean(imageElement && calibration.pixelSize && roi);
+    return particles.length > 0;
+  };
+
+  const getStepStatus = (step: WorkflowStep): StepStatus => {
+    if (step === currentStep) return 'active';
+    if (!canEnterStep(step)) return 'locked';
+    if (stepWarnings[step]) return 'warning';
+    if (
+      completedSteps[step] ||
+      (step === 'upload' && imageElement) ||
+      (step === 'calibration' && calibration.pixelSize) ||
+      (step === 'roi' && roi) ||
+      (step === 'detection' && particles.length > 0)
+    ) {
+      return 'complete';
+    }
+    return 'available';
+  };
+
+  const activeStepIndex = workflowSteps.findIndex((step) => step.id === currentStep);
+  const previousStep = workflowSteps[Math.max(0, activeStepIndex - 1)]?.id;
+  const nextStep = workflowSteps[Math.min(workflowSteps.length - 1, activeStepIndex + 1)]?.id;
+
+  const currentStepValid = () => {
+    if (currentStep === 'upload') return Boolean(imageElement);
+    if (currentStep === 'calibration') return Boolean(calibration.pixelSize);
+    if (currentStep === 'roi') return Boolean(roi);
+    if (currentStep === 'processing') return Boolean(imageElement && calibration.pixelSize && roi);
+    if (currentStep === 'detection') return particles.length > 0;
+    return particles.length > 0;
+  };
+
+  const goNext = () => {
+    if (!currentStepValid() || !nextStep) return;
+    completeStep(currentStep);
+    goToStep(nextStep);
+  };
+
+  const goBack = () => {
+    if (previousStep) goToStep(previousStep);
+  };
 
   const screenToImage = (clientX: number, clientY: number): Point => {
     const bounds = stageRef.current?.getBoundingClientRect();
@@ -148,6 +390,7 @@ export const App = () => {
         const result = analyzeImage(imageElement, roi, settings, calibration);
         setAnalysisResult(result.particles, result.maskDataUrl, result.overlayDataUrl);
         setDisplayMode('overlay');
+        goToStep('review');
         setStatus(`完成：偵測到 ${result.particles.length} 顆粒子。`);
       } catch (error) {
         setStatus(error instanceof Error ? error.message : 'OpenCV 分析失敗。');
@@ -211,12 +454,14 @@ export const App = () => {
           pixelSize: parsedLength / pixelLength,
           line: [dragStart, point],
         });
+        completeStep('calibration');
         setStatus(`校正完成：1 px = ${(parsedLength / pixelLength).toFixed(6)} ${unit}`);
       }
     } else if (toolMode === 'roi') {
       const nextROI = normalizeRect(dragStart, point);
       if (nextROI.width > 4 && nextROI.height > 4) {
         setROI(nextROI);
+        completeStep('roi');
         setStatus('ROI 已設定。');
       }
     } else if (toolMode === 'select') {
@@ -256,16 +501,18 @@ export const App = () => {
 
   const draftROI = dragStart && draftPoint && toolMode === 'roi' ? normalizeRect(dragStart, draftPoint) : null;
   const draftLine = dragStart && draftPoint && toolMode === 'calibrate' ? [dragStart, draftPoint] : calibration.line;
+  const activeStepLabel = workflowSteps.find((step) => step.id === currentStep)?.label ?? '';
 
-  return (
-    <main className="app-shell">
-      <aside className="sidebar">
-        <header>
-          <h1>SEM 粒徑分析器</h1>
-          <p>{status}</p>
-        </header>
+  const stepPanel = (
+    <section className="panel step-panel">
+      <div className="step-panel-heading">
+        <span>目前階段</span>
+        <h2>{activeStepLabel}</h2>
+        {stepWarnings[currentStep] && <p className="warning-text">{stepWarnings[currentStep]}</p>}
+      </div>
 
-        <section className="panel upload-panel">
+      {currentStep === 'upload' && (
+        <>
           <label
             className="dropzone"
             onDragOver={(event) => event.preventDefault()}
@@ -287,52 +534,19 @@ export const App = () => {
               </span>
             </div>
           )}
-        </section>
+        </>
+      )}
 
-        <section className="panel">
-          <h2>工具</h2>
-          <div className="icon-grid">
-            {toolModes.map((mode) => {
-              const Icon = mode.icon;
-              return (
-                <button
-                  key={mode.id}
-                  className={toolMode === mode.id ? 'active' : ''}
-                  onClick={() => setToolMode(mode.id)}
-                  title={mode.label}
-                  type="button"
-                >
-                  <Icon size={18} />
-                </button>
-              );
-            })}
-            <button type="button" onClick={fitToScreen} title="符合畫面">
-              <Maximize size={18} />
-            </button>
-          </div>
-          <div className="segmented">
-            {displayModes.map((mode) => (
-              <button
-                key={mode.id}
-                type="button"
-                className={displayMode === mode.id ? 'active' : ''}
-                onClick={() => setDisplayMode(mode.id)}
-              >
-                {mode.label}
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <section className="panel">
-          <h2>比例尺</h2>
+      {currentStep === 'calibration' && (
+        <>
+          <p className="step-hint">在影像上拖曳一條已知長度的比例尺線，輸入實際長度後即可進入 ROI。</p>
           <div className="form-row">
             <label>
-              實際長度
+              <ParameterLabel help={helpText.actualLength}>實際長度</ParameterLabel>
               <input value={actualLength} onChange={(event) => setActualLength(event.target.value)} inputMode="decimal" />
             </label>
             <label>
-              單位
+              <ParameterLabel help={helpText.unit}>單位</ParameterLabel>
               <select value={unit} onChange={(event) => setUnit(event.target.value as Unit)}>
                 {units.map((item) => (
                   <option key={item}>{item}</option>
@@ -343,12 +557,32 @@ export const App = () => {
           <p className="metric">
             {calibration.pixelSize ? `1 px = ${calibration.pixelSize.toFixed(6)} ${calibration.unit}` : '尚未校正'}
           </p>
-        </section>
+        </>
+      )}
 
-        <section className="panel">
-          <h2>Threshold</h2>
+      {currentStep === 'roi' && (
+        <>
+          <p className="step-hint">在影像上拖曳矩形 ROI。若要重新抓取，直接再畫一次即可。</p>
+          <div className="button-row">
+            <button type="button" onClick={() => setToolMode('roi')} className={toolMode === 'roi' ? 'active' : ''}>
+              <Scan size={16} />
+              ROI 工具
+            </button>
+            <button type="button" disabled={!roi} onClick={() => setROI(null)}>
+              清除 ROI
+            </button>
+          </div>
+          <p className="metric">
+            {roi ? `ROI：${Math.round(roi.width)} × ${Math.round(roi.height)} px` : '尚未設定 ROI'}
+          </p>
+        </>
+      )}
+
+      {currentStep === 'processing' && (
+        <>
+          <p className="step-hint">設定 threshold、粒子明暗與基本 morphology。完成後進入粒子辨識階段執行偵測。</p>
           <label>
-            Threshold：{settings.threshold}
+            <ParameterLabel help={helpText.threshold}>Threshold：{settings.threshold}</ParameterLabel>
             <input
               type="range"
               min="0"
@@ -357,6 +591,7 @@ export const App = () => {
               onChange={(event) => setSettings({ threshold: Number(event.target.value) })}
             />
           </label>
+          <ParameterLabel help={helpText.polarity}>粒子極性</ParameterLabel>
           <div className="segmented">
             <button
               type="button"
@@ -374,22 +609,7 @@ export const App = () => {
             </button>
           </div>
           <label>
-            疊圖透明度：{Math.round(settings.overlayOpacity * 100)}%
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={settings.overlayOpacity}
-              onChange={(event) => setSettings({ overlayOpacity: Number(event.target.value) })}
-            />
-          </label>
-        </section>
-
-        <section className="panel">
-          <h2>影像處理</h2>
-          <label>
-            Gaussian blur
+            <ParameterLabel help={helpText.blur}>Gaussian blur</ParameterLabel>
             <select
               value={settings.blurKernel}
               onChange={(event) => setSettings({ blurKernel: Number(event.target.value) as 0 | 3 | 5 | 7 })}
@@ -402,7 +622,7 @@ export const App = () => {
             </select>
           </label>
           <label>
-            Opening：{settings.openingIterations}
+            <ParameterLabel help={helpText.opening}>Opening：{settings.openingIterations}</ParameterLabel>
             <input
               type="range"
               min="0"
@@ -412,7 +632,7 @@ export const App = () => {
             />
           </label>
           <label>
-            Closing：{settings.closingIterations}
+            <ParameterLabel help={helpText.closing}>Closing：{settings.closingIterations}</ParameterLabel>
             <input
               type="range"
               min="0"
@@ -421,28 +641,36 @@ export const App = () => {
               onChange={(event) => setSettings({ closingIterations: Number(event.target.value) })}
             />
           </label>
-          <button className="primary" type="button" disabled={!imageElement} onClick={runAnalysis}>
-            開始分析
+        </>
+      )}
+
+      {currentStep === 'detection' && (
+        <>
+          <p className="step-hint">使用目前 ROI 與 threshold 設定執行粒子辨識。辨識完成後會自動進入手動刪除階段。</p>
+          <button className="primary" type="button" disabled={!imageElement || !roi} onClick={runAnalysis}>
+            開始粒子辨識
           </button>
+          <p className="metric">{particles.length ? `已辨識 ${particles.length} 顆粒子` : '尚未執行辨識'}</p>
+        </>
+      )}
+
+      {currentStep === 'review' && (
+        <>
+          <p className="step-hint">點擊影像上的粒子可排除，再次點擊可恢復。表格列可同步高亮粒子。</p>
           <div className="button-row">
-            <button type="button" disabled={!roi} onClick={() => setROI(null)}>
-              清除 ROI
-            </button>
             <button type="button" disabled={!undoStack.length} onClick={undo} title="Undo">
               <Undo2 size={16} />
+              Undo
             </button>
             <button type="button" disabled={!redoStack.length} onClick={redo} title="Redo">
               <Redo2 size={16} />
+              Redo
             </button>
           </div>
           <label className="checkbox-line">
             <input type="checkbox" checked={showExcluded} onChange={(event) => setShowExcluded(event.target.checked)} />
-            顯示已排除粒子
+            <ParameterLabel help={helpText.showExcluded}>顯示已排除粒子</ParameterLabel>
           </label>
-        </section>
-
-        <section className="panel">
-          <h2>輸出</h2>
           <div className="button-row">
             <button type="button" disabled={!particles.length} onClick={() => downloadCSV(particles)}>
               <FileDown size={16} />
@@ -457,7 +685,114 @@ export const App = () => {
               PNG
             </button>
           </div>
+        </>
+      )}
+
+      <div className="step-actions">
+        <button type="button" disabled={currentStep === 'upload'} onClick={goBack}>
+          <ChevronLeft size={16} />
+          上一步
+        </button>
+        <button type="button" className="primary" disabled={!currentStepValid() || currentStep === 'review'} onClick={goNext}>
+          下一步
+          <ChevronRight size={16} />
+        </button>
+      </div>
+    </section>
+  );
+
+  return (
+    <main className="app-shell">
+      <aside className="sidebar">
+        <header>
+          <h1>SEM 粒徑分析器</h1>
+          <p>{status}</p>
+        </header>
+
+        <WorkflowStepper
+          steps={workflowSteps}
+          currentStep={currentStep}
+          getStatus={getStepStatus}
+          onSelect={(step) => {
+            if (canEnterStep(step)) goToStep(step);
+          }}
+        />
+
+        {stepPanel}
+
+        <section className="panel summary-panel">
+          <h2>分析摘要</h2>
+          <dl className="summary-grid">
+            <div>
+              <dt>影像</dt>
+              <dd>{image ? `${image.width} × ${image.height}px` : '尚未上傳'}</dd>
+            </div>
+            <div>
+              <dt>比例尺</dt>
+              <dd>{calibration.pixelSize ? `${calibration.pixelSize.toFixed(5)} ${calibration.unit}/px` : '尚未校正'}</dd>
+            </div>
+            <div>
+              <dt>ROI</dt>
+              <dd>{roi ? `${Math.round(roi.width)} × ${Math.round(roi.height)}px` : '尚未設定'}</dd>
+            </div>
+            <div>
+              <dt>粒子</dt>
+              <dd>
+                總數 {summary.total} / 有效 {summary.valid} / 排除 {excludedCount}
+              </dd>
+            </div>
+          </dl>
         </section>
+
+        <details className="panel advanced-panel">
+          <summary>進階工具</summary>
+          <div className="advanced-content">
+            <h2>工具</h2>
+            <div className="icon-grid">
+              {toolModes.map((mode) => {
+                const Icon = mode.icon;
+                return (
+                  <button
+                    key={mode.id}
+                    className={toolMode === mode.id ? 'active' : ''}
+                    onClick={() => setToolMode(mode.id)}
+                    title={mode.label}
+                    type="button"
+                  >
+                    <Icon size={18} />
+                  </button>
+                );
+              })}
+              <button type="button" onClick={fitToScreen} title="符合畫面">
+                <Maximize size={18} />
+              </button>
+            </div>
+            <h2>顯示模式</h2>
+            <div className="segmented">
+              {displayModes.map((mode) => (
+                <button
+                  key={mode.id}
+                  type="button"
+                  className={displayMode === mode.id ? 'active' : ''}
+                  onClick={() => setDisplayMode(mode.id)}
+                >
+                  {mode.label}
+                </button>
+              ))}
+            </div>
+            <label>
+              <ParameterLabel help={helpText.overlayOpacity}>疊圖透明度：{Math.round(settings.overlayOpacity * 100)}%</ParameterLabel>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={settings.overlayOpacity}
+                onChange={(event) => setSettings({ overlayOpacity: Number(event.target.value) })}
+              />
+            </label>
+          </div>
+        </details>
       </aside>
 
       <section className="workspace">
@@ -515,6 +850,7 @@ export const App = () => {
                           'particle-outline',
                           particle.excluded ? 'excluded' : '',
                           particle.id === selectedParticleId ? 'selected' : '',
+                          highlightedParticleIdSet.has(particle.id) ? 'histogram-highlight' : '',
                         ].join(' ')}
                       />
                     ))}
@@ -524,54 +860,173 @@ export const App = () => {
         </div>
 
         <div className="results">
-          <div className="stats">
-            <span>總粒子 {summary.total}</span>
-            <span>有效 {summary.valid}</span>
-            <span>
-              平均直徑 {summary.mean.toFixed(2)} px
-              {calibration.pixelSize ? ` / ${(summary.mean * calibration.pixelSize).toFixed(2)} ${calibration.unit}` : ''}
-            </span>
-          </div>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <SortableHead label="ID" sortKey="id" current={sortKey} direction={sortDirection} onSort={setSort} />
-                  <SortableHead label="Area" sortKey="area" current={sortKey} direction={sortDirection} onSort={setSort} />
-                  <SortableHead label="Equivalent diameter" sortKey="diameter" current={sortKey} direction={sortDirection} onSort={setSort} />
-                  <th>Centroid X</th>
-                  <th>Centroid Y</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sortedParticles.map((particle) => (
-                  <tr
-                    key={particle.id}
-                    className={particle.id === selectedParticleId ? 'selected-row' : ''}
-                    onClick={() => setSelectedParticleId(particle.id)}
-                  >
-                    <td>{particle.id}</td>
-                    <td>{particle.areaPx2.toFixed(1)}</td>
-                    <td>
-                      {particle.equivalentDiameterPx.toFixed(2)} px
-                      {particle.equivalentDiameterActual !== null
-                        ? ` / ${particle.equivalentDiameterActual.toFixed(2)} ${calibration.unit}`
-                        : ''}
-                    </td>
-                    <td>{particle.centroidX.toFixed(1)}</td>
-                    <td>{particle.centroidY.toFixed(1)}</td>
-                    <td>{particle.excluded ? '排除' : '有效'}</td>
+          <section className="diameter-summary" aria-label="粒徑統計">
+            <div className="results-heading">
+              <div>
+                <span>粒徑統計</span>
+                <h2>有效實際粒徑分布</h2>
+              </div>
+              <label className="bin-control">
+                <ParameterLabel help={helpText.binWidth}>
+                  Bin 寬度：{formatActual(diameterStats.count ? activeBinWidth : null, diameterStats.unit)}
+                </ParameterLabel>
+                <input
+                  type="range"
+                  min={binWidthBounds.min}
+                  max={binWidthBounds.max}
+                  step={binWidthBounds.step}
+                  value={activeBinWidth}
+                  disabled={!diameterStats.count}
+                  onChange={(event) => {
+                    setHistogramBinWidthActual(Number(event.target.value));
+                    setHighlightedParticleIds([]);
+                  }}
+                />
+              </label>
+            </div>
+
+            {diameterStats.count ? (
+              <>
+                <dl className="diameter-stat-grid">
+                  <div>
+                    <dt>有效粒子</dt>
+                    <dd>{diameterStats.count}</dd>
+                  </div>
+                  <div>
+                    <dt>最小值</dt>
+                    <dd>{formatActual(diameterStats.min, diameterStats.unit)}</dd>
+                  </div>
+                  <div>
+                    <dt>最大值</dt>
+                    <dd>{formatActual(diameterStats.max, diameterStats.unit)}</dd>
+                  </div>
+                  <div>
+                    <dt>R 值</dt>
+                    <dd>{formatActual(diameterStats.range, diameterStats.unit)}</dd>
+                  </div>
+                  <div>
+                    <dt>平均</dt>
+                    <dd>{formatActual(diameterStats.mean, diameterStats.unit)}</dd>
+                  </div>
+                  <div>
+                    <dt>標準差</dt>
+                    <dd>{formatActual(diameterStats.standardDeviation, diameterStats.unit)}</dd>
+                  </div>
+                </dl>
+
+                <div className="histogram-panel">
+                  <div className="histogram-bars" style={{ gridTemplateColumns: `repeat(${histogramBins.length}, minmax(8px, 1fr))` }}>
+                    {histogramBins.map((bin) => {
+                      const isHighlighted =
+                        bin.count > 0 &&
+                        highlightedParticleIds.length === bin.particleIds.length &&
+                        bin.particleIds.every((id) => highlightedParticleIdSet.has(id));
+                      return (
+                        <button
+                          key={bin.id}
+                          type="button"
+                          className={`histogram-bin ${isHighlighted ? 'active-bin' : ''}`}
+                          disabled={!bin.count}
+                          onClick={() => toggleHistogramBin(bin)}
+                          onMouseEnter={() => setHoveredBinId(bin.id)}
+                          onMouseLeave={() => setHoveredBinId(null)}
+                          aria-label={`${formatActual(bin.start, diameterStats.unit)} 到 ${formatActual(
+                            bin.end,
+                            diameterStats.unit,
+                          )}，${bin.count} 顆`}
+                        >
+                          <span className="histogram-fill" style={{ height: `${Math.max(5, (bin.count / maxBinCount) * 100)}%` }} />
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="histogram-axis">
+                    <span>{formatActual(diameterStats.min, diameterStats.unit)}</span>
+                    <span>{formatActual(diameterStats.max, diameterStats.unit)}</span>
+                  </div>
+                  <p className="histogram-tooltip">
+                    {hoveredBin
+                      ? `${formatActual(hoveredBin.start, diameterStats.unit)} - ${formatActual(
+                          hoveredBin.end,
+                          diameterStats.unit,
+                        )}：${hoveredBin.count} 顆 (${hoveredBin.percentage.toFixed(1)}%)`
+                      : highlightedParticleIds.length
+                        ? `已高亮 ${highlightedParticleIds.length} 顆；再次點選同一個 bin 可取消`
+                        : '滑過 bin 查看範圍，點選可在影像上高亮該粒徑區間'}
+                  </p>
+                </div>
+              </>
+            ) : (
+              <div className="stats-empty">
+                {particles.length ? '目前沒有有效實際粒徑。請確認比例尺或恢復至少一顆有效粒子。' : '完成粒子辨識後，這裡會顯示粒徑分布與統計。'}
+              </div>
+            )}
+          </section>
+
+          <details className="particle-details">
+            <summary>詳細粒子資料</summary>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <SortableHead label="ID" sortKey="id" current={sortKey} direction={sortDirection} onSort={setSort} />
+                    <SortableHead label="Area" sortKey="area" current={sortKey} direction={sortDirection} onSort={setSort} />
+                    <SortableHead label="Equivalent diameter" sortKey="diameter" current={sortKey} direction={sortDirection} onSort={setSort} />
+                    <th>Centroid X</th>
+                    <th>Centroid Y</th>
+                    <th>Status</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {sortedParticles.map((particle) => (
+                    <tr
+                      key={particle.id}
+                      className={particle.id === selectedParticleId ? 'selected-row' : ''}
+                      onClick={() => setSelectedParticleId(particle.id)}
+                    >
+                      <td>{particle.id}</td>
+                      <td>{particle.areaPx2.toFixed(1)}</td>
+                      <td>
+                        {particle.equivalentDiameterPx.toFixed(2)} px
+                        {particle.equivalentDiameterActual !== null
+                          ? ` / ${particle.equivalentDiameterActual.toFixed(2)} ${calibration.unit}`
+                          : ''}
+                      </td>
+                      <td>{particle.centroidX.toFixed(1)}</td>
+                      <td>{particle.centroidY.toFixed(1)}</td>
+                      <td>{particle.excluded ? '排除' : '有效'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
         </div>
       </section>
     </main>
   );
 };
+
+interface ParameterLabelProps {
+  children: ReactNode;
+  help: string;
+}
+
+const ParameterLabel = ({ children, help }: ParameterLabelProps) => (
+  <span className="parameter-label">
+    <span>{children}</span>
+    <HelpTip text={help} />
+  </span>
+);
+
+const HelpTip = ({ text }: { text: string }) => (
+  <span className="help-tip" tabIndex={0} aria-label={text}>
+    ?
+    <span className="help-tooltip" role="tooltip">
+      {text}
+    </span>
+  </span>
+);
 
 interface SortableHeadProps {
   label: string;
@@ -580,6 +1035,36 @@ interface SortableHeadProps {
   direction: 'asc' | 'desc';
   onSort: (key: SortKey) => void;
 }
+
+interface WorkflowStepperProps {
+  steps: Array<{ id: WorkflowStep; label: string }>;
+  currentStep: WorkflowStep;
+  getStatus: (step: WorkflowStep) => StepStatus;
+  onSelect: (step: WorkflowStep) => void;
+}
+
+const WorkflowStepper = ({ steps, currentStep, getStatus, onSelect }: WorkflowStepperProps) => (
+  <nav className="workflow-stepper" aria-label="分析流程">
+    {steps.map((step, index) => {
+      const status = getStatus(step.id);
+      const isLocked = status === 'locked';
+      return (
+        <button
+          key={step.id}
+          type="button"
+          className={`workflow-step ${status} ${currentStep === step.id ? 'active' : ''}`}
+          disabled={isLocked}
+          onClick={() => onSelect(step.id)}
+        >
+          <span className="step-index">
+            {status === 'complete' ? <CheckCircle2 size={15} /> : status === 'warning' ? <AlertCircle size={15} /> : index + 1}
+          </span>
+          <span>{step.label}</span>
+        </button>
+      );
+    })}
+  </nav>
+);
 
 const SortableHead = ({ label, sortKey, current, direction, onSort }: SortableHeadProps) => (
   <th>

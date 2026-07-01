@@ -9,6 +9,7 @@ import type {
   SortDirection,
   SortKey,
   ToolMode,
+  WorkflowStep,
 } from './types';
 
 interface AnalyzerState {
@@ -28,8 +29,14 @@ interface AnalyzerState {
   sortDirection: SortDirection;
   undoStack: Particle[][];
   redoStack: Particle[][];
+  currentStep: WorkflowStep;
+  completedSteps: Partial<Record<WorkflowStep, boolean>>;
+  dirtyFromStep: WorkflowStep | null;
+  stepWarnings: Partial<Record<WorkflowStep, string>>;
   setImage: (image: ImageInfo, imageElement: HTMLImageElement) => void;
   resetImage: () => void;
+  goToStep: (step: WorkflowStep) => void;
+  completeStep: (step: WorkflowStep) => void;
   setDisplayMode: (mode: DisplayMode) => void;
   setToolMode: (mode: ToolMode) => void;
   setROI: (roi: ROI | null) => void;
@@ -83,12 +90,16 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
   sortDirection: 'asc',
   undoStack: [],
   redoStack: [],
+  currentStep: 'upload',
+  completedSteps: {},
+  dirtyFromStep: null,
+  stepWarnings: {},
   setImage: (image, imageElement) =>
     set({
       image,
       imageElement,
       displayMode: 'original',
-      toolMode: 'select',
+      toolMode: 'calibrate',
       roi: null,
       calibration: defaultCalibration,
       settings: defaultSettings,
@@ -98,6 +109,10 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
       overlayDataUrl: null,
       undoStack: [],
       redoStack: [],
+      currentStep: 'calibration',
+      completedSteps: { upload: true },
+      dirtyFromStep: null,
+      stepWarnings: {},
     }),
   resetImage: () =>
     set({
@@ -111,10 +126,54 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
       overlayDataUrl: null,
       undoStack: [],
       redoStack: [],
+      currentStep: 'upload',
+      completedSteps: {},
+      dirtyFromStep: null,
+      stepWarnings: {},
     }),
+  goToStep: (currentStep) =>
+    set((state) => ({
+      currentStep,
+      toolMode:
+        currentStep === 'calibration'
+          ? 'calibrate'
+          : currentStep === 'roi'
+            ? 'roi'
+            : currentStep === 'review'
+              ? 'select'
+              : state.toolMode,
+      displayMode:
+        currentStep === 'processing'
+          ? 'mask'
+          : currentStep === 'detection' || currentStep === 'review'
+            ? 'overlay'
+            : state.displayMode,
+    })),
+  completeStep: (step) =>
+    set((state) => ({
+      completedSteps: { ...state.completedSteps, [step]: true },
+      stepWarnings: { ...state.stepWarnings, [step]: undefined },
+    })),
   setDisplayMode: (displayMode) => set({ displayMode }),
   setToolMode: (toolMode) => set({ toolMode }),
-  setROI: (roi) => set({ roi }),
+  setROI: (roi) =>
+    set((state) => ({
+      roi,
+      maskDataUrl: null,
+      overlayDataUrl: null,
+      particles: [],
+      selectedParticleId: null,
+      undoStack: [],
+      redoStack: [],
+      completedSteps: { ...state.completedSteps, roi: Boolean(roi), processing: false, detection: false, review: false },
+      dirtyFromStep: 'roi',
+      stepWarnings: {
+        ...state.stepWarnings,
+        processing: roi ? 'ROI 已變更，請重新確認 threshold。' : undefined,
+        detection: undefined,
+        review: undefined,
+      },
+    })),
   setCalibration: (calibration) =>
     set((state) => ({
       calibration,
@@ -125,8 +184,37 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
           ? particle.equivalentDiameterPx * calibration.pixelSize
           : null,
       })),
+      completedSteps: { ...state.completedSteps, calibration: Boolean(calibration.pixelSize) },
+      stepWarnings: {
+        ...state.stepWarnings,
+        calibration: undefined,
+        review: state.particles.length ? '比例尺已更新，實際尺寸已重新換算。' : undefined,
+      },
     })),
-  setSettings: (settings) => set((state) => ({ settings: { ...state.settings, ...settings } })),
+  setSettings: (settings) =>
+    set((state) => {
+      const invalidatesDetection = Object.keys(settings).some((key) => key !== 'overlayOpacity');
+      if (!invalidatesDetection) {
+        return { settings: { ...state.settings, ...settings } };
+      }
+      return {
+        settings: { ...state.settings, ...settings },
+        maskDataUrl: null,
+        overlayDataUrl: null,
+        particles: [],
+        selectedParticleId: null,
+        undoStack: [],
+        redoStack: [],
+        completedSteps: { ...state.completedSteps, processing: false, detection: false, review: false },
+        dirtyFromStep: 'processing',
+        stepWarnings: {
+          ...state.stepWarnings,
+          processing: '影像處理設定已變更，請重新套用並辨識粒子。',
+          detection: undefined,
+          review: undefined,
+        },
+      };
+    }),
   setAnalysisResult: (particles, maskDataUrl, overlayDataUrl) =>
     set((state) => {
       const excluded = new Set(state.particles.filter((particle) => particle.excluded).map((particle) => particle.id));
@@ -137,6 +225,9 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
         selectedParticleId: null,
         undoStack: [],
         redoStack: [],
+        completedSteps: { ...state.completedSteps, processing: true, detection: true },
+        dirtyFromStep: null,
+        stepWarnings: { ...state.stepWarnings, processing: undefined, detection: undefined },
       };
     }),
   setSelectedParticleId: (selectedParticleId) => set({ selectedParticleId }),
