@@ -42,9 +42,15 @@ interface AnalyzerState {
   setROI: (roi: ROI | null) => void;
   setCalibration: (calibration: Calibration) => void;
   setSettings: (settings: Partial<ProcessingSettings>) => void;
-  setAnalysisResult: (particles: Particle[], maskDataUrl: string, overlayDataUrl: string) => void;
+  setAnalysisResult: (
+    particles: Particle[],
+    maskDataUrl: string,
+    overlayDataUrl: string,
+    options?: { preserveExcluded?: boolean },
+  ) => void;
   setSelectedParticleId: (id: number | null) => void;
   toggleParticleExcluded: (id: number) => void;
+  excludeParticles: (ids: number[]) => void;
   undo: () => void;
   redo: () => void;
   setShowExcluded: (show: boolean) => void;
@@ -83,7 +89,7 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
   settings: defaultSettings,
   particles: [],
   selectedParticleId: null,
-  showExcluded: true,
+  showExcluded: false,
   maskDataUrl: null,
   overlayDataUrl: null,
   sortKey: 'id',
@@ -105,6 +111,7 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
       settings: defaultSettings,
       particles: [],
       selectedParticleId: null,
+      showExcluded: false,
       maskDataUrl: null,
       overlayDataUrl: null,
       undoStack: [],
@@ -122,6 +129,7 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
       calibration: defaultCalibration,
       particles: [],
       selectedParticleId: null,
+      showExcluded: false,
       maskDataUrl: null,
       overlayDataUrl: null,
       undoStack: [],
@@ -139,13 +147,15 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
           ? 'calibrate'
           : currentStep === 'roi'
             ? 'roi'
+            : currentStep === 'processing'
+              ? 'pan'
             : currentStep === 'review'
-              ? 'select'
+              ? 'erase'
               : state.toolMode,
       displayMode:
         currentStep === 'processing'
-          ? 'mask'
-          : currentStep === 'detection' || currentStep === 'review'
+          ? 'overlay'
+          : currentStep === 'review'
             ? 'overlay'
             : state.displayMode,
     })),
@@ -165,12 +175,11 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
       selectedParticleId: null,
       undoStack: [],
       redoStack: [],
-      completedSteps: { ...state.completedSteps, roi: Boolean(roi), processing: false, detection: false, review: false },
+      completedSteps: { ...state.completedSteps, roi: Boolean(roi), processing: false, review: false },
       dirtyFromStep: 'roi',
       stepWarnings: {
         ...state.stepWarnings,
         processing: roi ? 'ROI 已變更，請重新確認 threshold。' : undefined,
-        detection: undefined,
         review: undefined,
       },
     })),
@@ -180,9 +189,7 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
       particles: state.particles.map((particle) => ({
         ...particle,
         areaActual: calibration.pixelSize ? particle.areaPx2 * calibration.pixelSize * calibration.pixelSize : null,
-        equivalentDiameterActual: calibration.pixelSize
-          ? particle.equivalentDiameterPx * calibration.pixelSize
-          : null,
+        diameterActual: calibration.pixelSize ? particle.diameterPx * calibration.pixelSize : null,
       })),
       completedSteps: { ...state.completedSteps, calibration: Boolean(calibration.pixelSize) },
       stepWarnings: {
@@ -199,35 +206,33 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
       }
       return {
         settings: { ...state.settings, ...settings },
-        maskDataUrl: null,
-        overlayDataUrl: null,
-        particles: [],
         selectedParticleId: null,
         undoStack: [],
         redoStack: [],
-        completedSteps: { ...state.completedSteps, processing: false, detection: false, review: false },
+        completedSteps: { ...state.completedSteps, processing: false, review: false },
         dirtyFromStep: 'processing',
         stepWarnings: {
           ...state.stepWarnings,
-          processing: '影像處理設定已變更，請重新套用並辨識粒子。',
-          detection: undefined,
+          processing: '影像處理設定已變更，正在更新即時預覽。',
           review: undefined,
         },
       };
     }),
-  setAnalysisResult: (particles, maskDataUrl, overlayDataUrl) =>
+  setAnalysisResult: (particles, maskDataUrl, overlayDataUrl, options = {}) =>
     set((state) => {
-      const excluded = new Set(state.particles.filter((particle) => particle.excluded).map((particle) => particle.id));
+      const excluded = options.preserveExcluded
+        ? new Set(state.particles.filter((particle) => particle.excluded).map((particle) => particle.id))
+        : new Set<number>();
       return {
-        particles: particles.map((particle) => ({ ...particle, excluded: excluded.has(particle.id) })),
+        particles: particles.map((particle) => ({ ...particle, excluded: particle.excluded || excluded.has(particle.id) })),
         maskDataUrl,
         overlayDataUrl,
         selectedParticleId: null,
         undoStack: [],
         redoStack: [],
-        completedSteps: { ...state.completedSteps, processing: true, detection: true },
+        completedSteps: { ...state.completedSteps, processing: true },
         dirtyFromStep: null,
-        stepWarnings: { ...state.stepWarnings, processing: undefined, detection: undefined },
+        stepWarnings: { ...state.stepWarnings, processing: undefined },
       };
     }),
   setSelectedParticleId: (selectedParticleId) => set({ selectedParticleId }),
@@ -240,6 +245,18 @@ export const useAnalyzerStore = create<AnalyzerState>((set) => ({
       undoStack: pushHistory(state.particles, state.undoStack),
       redoStack: [],
     })),
+  excludeParticles: (ids) =>
+    set((state) => {
+      const idSet = new Set(ids);
+      const hasNewExclusion = state.particles.some((particle) => idSet.has(particle.id) && !particle.excluded);
+      if (!hasNewExclusion) return state;
+      return {
+        particles: state.particles.map((particle) => (idSet.has(particle.id) ? { ...particle, excluded: true } : particle)),
+        selectedParticleId: null,
+        undoStack: pushHistory(state.particles, state.undoStack),
+        redoStack: [],
+      };
+    }),
   undo: () =>
     set((state) => {
       const [previous, ...rest] = state.undoStack;

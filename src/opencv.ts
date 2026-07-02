@@ -27,14 +27,37 @@ const contourToPoints = (contour: InstanceType<typeof cv.Mat>, offsetX: number, 
   return points;
 };
 
+const contourMaxDistance = (contour: InstanceType<typeof cv.Mat>) => {
+  let maxDistance = 0;
+  for (let i = 0; i < contour.rows; i += 1) {
+    const current = contour.intPtr(i, 0);
+    for (let j = i + 1; j < contour.rows; j += 1) {
+      const next = contour.intPtr(j, 0);
+      const distance = Math.hypot(current[0] - next[0], current[1] - next[1]);
+      if (distance > maxDistance) {
+        maxDistance = distance;
+      }
+    }
+  }
+  return maxDistance;
+};
+
 const makeActualValues = (areaPx2: number, diameterPx: number, calibration: Calibration) => {
   if (!calibration.pixelSize) {
-    return { areaActual: null, equivalentDiameterActual: null };
+    return { areaActual: null, diameterActual: null };
   }
   return {
     areaActual: areaPx2 * calibration.pixelSize * calibration.pixelSize,
-    equivalentDiameterActual: diameterPx * calibration.pixelSize,
+    diameterActual: diameterPx * calibration.pixelSize,
   };
+};
+
+const touchesROIBoundary = (points: Point[], roi: InstanceType<typeof cv.Rect>) => {
+  const left = roi.x;
+  const top = roi.y;
+  const right = roi.x + roi.width - 1;
+  const bottom = roi.y + roi.height - 1;
+  return points.some((point) => point.x <= left || point.x >= right || point.y <= top || point.y >= bottom);
 };
 
 export const analyzeImage = (
@@ -96,18 +119,19 @@ export const analyzeImage = (
         contour.delete();
         continue;
       }
-      const equivalentDiameterPx = 2 * Math.sqrt(areaPx2 / Math.PI);
-      const actual = makeActualValues(areaPx2, equivalentDiameterPx, calibration);
+      const diameterPx = contourMaxDistance(contour);
+      const actual = makeActualValues(areaPx2, diameterPx, calibration);
+      const contourPoints = contourToPoints(contour, rect.x, rect.y);
       particles.push({
         id: particles.length + 1,
         areaPx2,
         areaActual: actual.areaActual,
-        equivalentDiameterPx,
-        equivalentDiameterActual: actual.equivalentDiameterActual,
+        diameterPx,
+        diameterActual: actual.diameterActual,
         centroidX: moments.m10 / moments.m00 + rect.x,
         centroidY: moments.m01 / moments.m00 + rect.y,
-        excluded: false,
-        contour: contourToPoints(contour, rect.x, rect.y),
+        excluded: touchesROIBoundary(contourPoints, rect),
+        contour: contourPoints,
       });
       contour.delete();
     }
@@ -120,7 +144,7 @@ export const analyzeImage = (
       for (let i = 0; i < particle.contour.length; i += 1) {
         const current = particle.contour[i];
         const next = particle.contour[(i + 1) % particle.contour.length];
-        cv.line(overlay, new cv.Point(current.x, current.y), new cv.Point(next.x, next.y), new cv.Scalar(28, 211, 151, 255), 2);
+        cv.line(overlay, new cv.Point(current.x, current.y), new cv.Point(next.x, next.y), new cv.Scalar(28, 211, 151, 255), 3);
       }
     });
     const overlayCanvas = document.createElement('canvas');

@@ -70,11 +70,59 @@ input[type='range'] {
   background: #111418;
 }
 
+.app-shell.review-mode {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 .sidebar {
   overflow-y: auto;
   border-right: 1px solid #2d3540;
   background: #171c22;
   padding: 1rem;
+}
+
+.review-toolbar {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 0.75rem;
+  align-items: center;
+  border-bottom: 1px solid #2d3540;
+  background: #171c22;
+  padding: 0.7rem 1rem;
+}
+
+.review-toolbar-status {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  color: #cbd5e1;
+}
+
+.review-toolbar-status strong {
+  color: #f8fafc;
+}
+
+.review-toolbar-status span {
+  min-width: 0;
+  color: #9aa8b7;
+  overflow-wrap: anywhere;
+}
+
+.review-toolbar-actions {
+  min-width: 0;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.review-toolbar-actions button {
+  min-height: 36px;
+  padding-block: 0.45rem;
 }
 
 header h1 {
@@ -197,18 +245,6 @@ header p {
   overflow-wrap: anywhere;
 }
 
-.advanced-panel summary {
-  cursor: pointer;
-  color: #cbd5e1;
-  font-weight: 700;
-}
-
-.advanced-content {
-  display: grid;
-  gap: 0.8rem;
-  padding-top: 0.85rem;
-}
-
 .panel h2 {
   margin: 0;
   font-size: 0.95rem;
@@ -309,11 +345,8 @@ label {
 }
 
 .help-tooltip {
-  position: absolute;
-  z-index: 20;
-  left: 50%;
-  bottom: calc(100% + 0.5rem);
-  width: min(280px, 72vw);
+  position: fixed;
+  z-index: 80;
   padding: 0.65rem 0.75rem;
   border: 1px solid #3f4a56;
   border-radius: 6px;
@@ -324,51 +357,52 @@ label {
   font-weight: 400;
   line-height: 1.5;
   text-align: left;
+  max-height: min(260px, 45vh);
+  overflow: auto;
   white-space: normal;
   opacity: 0;
   pointer-events: none;
-  transform: translate(-50%, 0.25rem);
+  transform: translate(-50%, 0);
   transition:
     opacity 140ms ease,
     transform 140ms ease;
   visibility: hidden;
 }
 
+.help-tooltip.visible {
+  opacity: 1;
+  visibility: visible;
+}
+
+.help-tooltip.top {
+  transform: translate(-50%, -100%);
+}
+
+.help-tooltip.bottom {
+  transform: translate(-50%, 0);
+}
+
 .help-tooltip::after {
   content: '';
   position: absolute;
   left: 50%;
-  top: 100%;
   width: 0.55rem;
   height: 0.55rem;
+  background: #0f141a;
+}
+
+.help-tooltip.top::after {
+  top: 100%;
   border-right: 1px solid #3f4a56;
   border-bottom: 1px solid #3f4a56;
-  background: #0f141a;
   transform: translate(-50%, -50%) rotate(45deg);
 }
 
-.results .help-tooltip {
-  top: calc(100% + 0.5rem);
-  bottom: auto;
-  transform: translate(-50%, -0.25rem);
-}
-
-.results .help-tooltip::after {
-  top: auto;
+.help-tooltip.bottom::after {
   bottom: 100%;
-  border-right: 0;
-  border-bottom: 0;
   border-left: 1px solid #3f4a56;
   border-top: 1px solid #3f4a56;
   transform: translate(-50%, 50%) rotate(45deg);
-}
-
-.help-tip:hover .help-tooltip,
-.help-tip:focus .help-tooltip,
-.help-tip:focus-visible .help-tooltip {
-  opacity: 1;
-  transform: translate(-50%, 0);
-  visibility: visible;
 }
 
 .checkbox-line {
@@ -379,6 +413,13 @@ label {
 
 .checkbox-line input {
   width: auto;
+}
+
+.compact-checkbox {
+  min-height: 36px;
+  padding: 0 0.35rem;
+  color: #cbd5e1;
+  white-space: nowrap;
 }
 
 .primary {
@@ -393,8 +434,16 @@ label {
 
 .workspace {
   min-width: 0;
+  min-height: 0;
   display: grid;
+}
+
+.workspace.with-results {
   grid-template-rows: minmax(0, 1fr) 340px;
+}
+
+.workspace.preview-only {
+  grid-template-rows: minmax(0, 1fr) auto;
 }
 
 .stage {
@@ -406,6 +455,56 @@ label {
     #0b0e12;
   background-size: 32px 32px;
   touch-action: none;
+}
+
+.stage-toolbar {
+  position: absolute;
+  z-index: 5;
+  top: 0.75rem;
+  right: 0.75rem;
+  width: min(320px, calc(100% - 1.5rem));
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.6rem;
+  border: 1px solid rgba(91, 103, 117, 0.8);
+  border-radius: 8px;
+  background: rgba(17, 24, 32, 0.9);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(10px);
+}
+
+.stage-tool-row,
+.stage-mode-row {
+  min-width: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.stage-tool-row {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.stage-tool-row button {
+  min-width: 0;
+  flex: 1 0 36px;
+  padding: 0.45rem;
+}
+
+.stage-mode-row {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.stage-mode-row button {
+  min-width: 0;
+  padding: 0.4rem 0.35rem;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.stage-opacity-control {
+  gap: 0.3rem;
+  font-size: 0.8rem;
 }
 
 .empty-state {
@@ -447,6 +546,14 @@ label {
   vector-effect: non-scaling-stroke;
 }
 
+.eraser-rect {
+  fill: rgba(255, 99, 132, 0.12);
+  stroke: #ff6384;
+  stroke-width: 2;
+  stroke-dasharray: 7 4;
+  vector-effect: non-scaling-stroke;
+}
+
 .calibration-line {
   stroke: #ffd166;
   stroke-width: 3;
@@ -456,7 +563,7 @@ label {
 .particle-outline {
   fill: rgba(28, 211, 151, 0.06);
   stroke: #1cd397;
-  stroke-width: 2;
+  stroke-width: 3;
   vector-effect: non-scaling-stroke;
 }
 
@@ -469,13 +576,13 @@ label {
 .particle-outline.selected {
   fill: rgba(255, 209, 102, 0.18);
   stroke: #ffd166;
-  stroke-width: 4;
+  stroke-width: 5;
 }
 
 .particle-outline.histogram-highlight {
   fill: rgba(84, 168, 255, 0.2);
   stroke: #54a8ff;
-  stroke-width: 4;
+  stroke-width: 5;
 }
 
 .particle-outline.selected.histogram-highlight {
@@ -490,6 +597,22 @@ label {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   overflow: hidden;
+}
+
+.preview-strip {
+  min-width: 0;
+  border-top: 1px solid #2d3540;
+  background: #171c22;
+  padding: 0.65rem 1rem;
+  color: #aab6c3;
+  font-size: 0.9rem;
+}
+
+.preview-strip span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .diameter-summary {
@@ -707,14 +830,34 @@ tbody tr:hover,
     grid-template-columns: 1fr;
   }
 
+  .app-shell.review-mode {
+    grid-template-rows: auto auto;
+  }
+
   .sidebar {
     border-right: 0;
     border-bottom: 1px solid #2d3540;
   }
 
+  .review-toolbar {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .review-toolbar-actions {
+    justify-content: flex-start;
+  }
+
   .workspace {
     min-height: 720px;
+  }
+
+  .workspace.with-results {
     grid-template-rows: 460px 360px;
+  }
+
+  .workspace.preview-only {
+    grid-template-rows: 540px auto;
   }
 
   .results-heading,

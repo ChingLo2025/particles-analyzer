@@ -1,10 +1,12 @@
 import { ChangeEvent, PointerEvent, ReactNode, useEffect, useMemo, useRef, useState, WheelEvent } from 'react';
 import {
   AlertCircle,
+  BoxSelect,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Download,
+  Eraser,
   FileDown,
   ImageUp,
   Maximize,
@@ -44,6 +46,8 @@ const toolModes: Array<{ id: ToolMode; label: string; icon: typeof MousePointer2
   { id: 'calibrate', label: '校正線', icon: Ruler },
   { id: 'roi', label: 'ROI', icon: Scan },
   { id: 'pan', label: '平移', icon: Move },
+  { id: 'erase', label: '橡皮擦', icon: Eraser },
+  { id: 'boxErase', label: '框選橡皮擦', icon: BoxSelect },
 ];
 
 const units: Unit[] = ['nm', 'µm', 'mm'];
@@ -53,7 +57,6 @@ const workflowSteps: Array<{ id: WorkflowStep; label: string }> = [
   { id: 'calibration', label: '比例尺校正' },
   { id: 'roi', label: 'ROI 抓取' },
   { id: 'processing', label: '影像處理' },
-  { id: 'detection', label: '粒子辨識' },
   { id: 'review', label: '手動刪除' },
 ];
 
@@ -92,7 +95,44 @@ const pointInPolygon = (point: Point, polygon: Point[]) => {
   return inside;
 };
 
-type ParticleWithActualDiameter = Particle & { equivalentDiameterActual: number };
+const pointInRect = (point: Point, rect: ROI) =>
+  point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
+
+const rectCorners = (rect: ROI): Point[] => [
+  { x: rect.x, y: rect.y },
+  { x: rect.x + rect.width, y: rect.y },
+  { x: rect.x + rect.width, y: rect.y + rect.height },
+  { x: rect.x, y: rect.y + rect.height },
+];
+
+const particleIntersectsRect = (particle: Particle, rect: ROI) =>
+  particle.contour.some((point) => pointInRect(point, rect)) ||
+  pointInRect({ x: particle.centroidX, y: particle.centroidY }, rect) ||
+  rectCorners(rect).some((corner) => pointInPolygon(corner, particle.contour));
+
+const distanceToSegment = (point: Point, start: Point, end: Point) => {
+  const lengthSquared = (end.x - start.x) ** 2 + (end.y - start.y) ** 2;
+  if (lengthSquared === 0) return distance(point, start);
+  const t = Math.max(0, Math.min(1, ((point.x - start.x) * (end.x - start.x) + (point.y - start.y) * (end.y - start.y)) / lengthSquared));
+  const projection = {
+    x: start.x + t * (end.x - start.x),
+    y: start.y + t * (end.y - start.y),
+  };
+  return distance(point, projection);
+};
+
+const particleIntersectsErasePath = (particle: Particle, path: Point[], radius: number) => {
+  if (path.some((point) => pointInPolygon(point, particle.contour))) return true;
+  return particle.contour.some((contourPoint) => {
+    if (path.some((point) => distance(contourPoint, point) <= radius)) return true;
+    for (let index = 1; index < path.length; index += 1) {
+      if (distanceToSegment(contourPoint, path[index - 1], path[index]) <= radius) return true;
+    }
+    return false;
+  });
+};
+
+type ParticleWithActualDiameter = Particle & { diameterActual: number };
 
 const formatNumber = (value: number) => {
   const abs = Math.abs(value);
@@ -144,7 +184,7 @@ export const App = () => {
     setSettings,
     setAnalysisResult,
     setSelectedParticleId,
-    toggleParticleExcluded,
+    excludeParticles,
     undo,
     redo,
     setShowExcluded,
@@ -163,6 +203,9 @@ export const App = () => {
   const [histogramBinWidthActual, setHistogramBinWidthActual] = useState(0);
   const [hoveredBinId, setHoveredBinId] = useState<string | null>(null);
   const [highlightedParticleIds, setHighlightedParticleIds] = useState<number[]>([]);
+  const [isPreviewUpdating, setIsPreviewUpdating] = useState(false);
+  const [erasePath, setErasePath] = useState<Point[]>([]);
+  const analysisRequestIdRef = useRef(0);
 
   const visibleImageUrl = useMemo(() => {
     if (displayMode === 'mask') return maskDataUrl ?? image?.url ?? '';
@@ -173,7 +216,7 @@ export const App = () => {
     const multiplier = sortDirection === 'asc' ? 1 : -1;
     const keyValue = (particle: Particle) => {
       if (sortKey === 'area') return particle.areaPx2;
-      if (sortKey === 'diameter') return particle.equivalentDiameterPx;
+      if (sortKey === 'diameter') return particle.diameterPx;
       return particle.id;
     };
     return [...particles].sort((a, b) => (keyValue(a) - keyValue(b)) * multiplier);
@@ -191,8 +234,8 @@ export const App = () => {
       particles.filter(
         (particle): particle is ParticleWithActualDiameter =>
           !particle.excluded &&
-          particle.equivalentDiameterActual !== null &&
-          Number.isFinite(particle.equivalentDiameterActual),
+          particle.diameterActual !== null &&
+          Number.isFinite(particle.diameterActual),
       ),
     [particles],
   );
@@ -210,7 +253,7 @@ export const App = () => {
       };
     }
 
-    const values = validDiameterParticles.map((particle) => particle.equivalentDiameterActual);
+    const values = validDiameterParticles.map((particle) => particle.diameterActual);
     const count = values.length;
     const min = Math.min(...values);
     const max = Math.max(...values);
@@ -274,7 +317,7 @@ export const App = () => {
     validDiameterParticles.forEach((particle) => {
       const index = Math.min(
         binCount - 1,
-        Math.max(0, Math.floor((particle.equivalentDiameterActual - diameterStats.min!) / activeBinWidth)),
+        Math.max(0, Math.floor((particle.diameterActual - diameterStats.min!) / activeBinWidth)),
       );
       bins[index].count += 1;
       bins[index].particleIds.push(particle.id);
@@ -289,6 +332,18 @@ export const App = () => {
 
   const hoveredBin = histogramBins.find((bin) => bin.id === hoveredBinId) ?? null;
   const highlightedParticleIdSet = useMemo(() => new Set(highlightedParticleIds), [highlightedParticleIds]);
+
+  const stageToolModes = useMemo(() => {
+    const idsByStep: Record<WorkflowStep, ToolMode[]> = {
+      upload: [],
+      calibration: ['calibrate', 'pan'],
+      roi: ['roi', 'pan'],
+      processing: ['select', 'pan', 'erase', 'boxErase'],
+      review: ['select', 'erase', 'boxErase', 'pan'],
+    };
+    const ids = idsByStep[currentStep];
+    return ids.map((id) => toolModes.find((mode) => mode.id === id)).filter((mode): mode is (typeof toolModes)[number] => Boolean(mode));
+  }, [currentStep]);
   const maxBinCount = Math.max(1, ...histogramBins.map((bin) => bin.count));
 
   useEffect(() => {
@@ -319,7 +374,6 @@ export const App = () => {
     if (step === 'calibration') return Boolean(imageElement);
     if (step === 'roi') return Boolean(imageElement && calibration.pixelSize);
     if (step === 'processing') return Boolean(imageElement && calibration.pixelSize && roi);
-    if (step === 'detection') return Boolean(imageElement && calibration.pixelSize && roi);
     return particles.length > 0;
   };
 
@@ -332,7 +386,7 @@ export const App = () => {
       (step === 'upload' && imageElement) ||
       (step === 'calibration' && calibration.pixelSize) ||
       (step === 'roi' && roi) ||
-      (step === 'detection' && particles.length > 0)
+      (step === 'processing' && particles.length > 0)
     ) {
       return 'complete';
     }
@@ -347,8 +401,7 @@ export const App = () => {
     if (currentStep === 'upload') return Boolean(imageElement);
     if (currentStep === 'calibration') return Boolean(calibration.pixelSize);
     if (currentStep === 'roi') return Boolean(roi);
-    if (currentStep === 'processing') return Boolean(imageElement && calibration.pixelSize && roi);
-    if (currentStep === 'detection') return particles.length > 0;
+    if (currentStep === 'processing') return particles.length > 0 && !isPreviewUpdating;
     return particles.length > 0;
   };
 
@@ -382,22 +435,6 @@ export const App = () => {
     });
   };
 
-  const runAnalysis = () => {
-    if (!imageElement) return;
-    setStatus('分析中...');
-    requestAnimationFrame(() => {
-      try {
-        const result = analyzeImage(imageElement, roi, settings, calibration);
-        setAnalysisResult(result.particles, result.maskDataUrl, result.overlayDataUrl);
-        setDisplayMode('overlay');
-        goToStep('review');
-        setStatus(`完成：偵測到 ${result.particles.length} 顆粒子。`);
-      } catch (error) {
-        setStatus(error instanceof Error ? error.message : 'OpenCV 分析失敗。');
-      }
-    });
-  };
-
   const handleFile = (file: File) => {
     if (!file.type.startsWith('image/')) return;
     const url = URL.createObjectURL(file);
@@ -428,6 +465,7 @@ export const App = () => {
     const point = screenToImage(event.clientX, event.clientY);
     setDragStart(toolMode === 'pan' ? { x: event.clientX - offset.x, y: event.clientY - offset.y } : point);
     setDraftPoint(point);
+    setErasePath(toolMode === 'erase' ? [point] : []);
     setIsDragging(true);
   };
 
@@ -437,7 +475,11 @@ export const App = () => {
       setOffset({ x: event.clientX - dragStart.x, y: event.clientY - dragStart.y });
       return;
     }
-    setDraftPoint(screenToImage(event.clientX, event.clientY));
+    const point = screenToImage(event.clientX, event.clientY);
+    setDraftPoint(point);
+    if (toolMode === 'erase') {
+      setErasePath((path) => [...path, point]);
+    }
   };
 
   const handlePointerUp = (event: PointerEvent<HTMLDivElement>) => {
@@ -464,18 +506,36 @@ export const App = () => {
         completeStep('roi');
         setStatus('ROI 已設定。');
       }
+    } else if (toolMode === 'boxErase') {
+      const eraseRect = normalizeRect(dragStart, point);
+      if (eraseRect.width > 4 && eraseRect.height > 4) {
+        const ids = particles
+          .filter((particle) => !particle.excluded && particleIntersectsRect(particle, eraseRect))
+          .map((particle) => particle.id);
+        excludeParticles(ids);
+        setStatus(ids.length ? `已排除 ${ids.length} 顆粒子。` : '框選範圍內沒有可排除粒子。');
+      }
+    } else if (toolMode === 'erase') {
+      const path = erasePath.length ? [...erasePath, point] : [point];
+      const radius = Math.max(3, 14 / scale);
+      const ids = particles
+        .filter((particle) => !particle.excluded && particleIntersectsErasePath(particle, path, radius))
+        .map((particle) => particle.id);
+      excludeParticles(ids);
+      setStatus(ids.length ? `已排除 ${ids.length} 顆粒子。` : '橡皮擦路徑沒有碰到可排除粒子。');
     } else if (toolMode === 'select') {
       const particle = [...particles]
         .reverse()
         .find((candidate) => (showExcluded || !candidate.excluded) && pointInPolygon(point, candidate.contour));
       if (particle) {
-        toggleParticleExcluded(particle.id);
-        setStatus(`粒子 ${particle.id} 已${particle.excluded ? '恢復' : '排除'}。`);
+        setSelectedParticleId(particle.id);
+        setStatus(`已選取粒子 ${particle.id}。`);
       }
     }
     setIsDragging(false);
     setDragStart(null);
     setDraftPoint(null);
+    setErasePath([]);
   };
 
   const handleWheel = (event: WheelEvent<HTMLDivElement>) => {
@@ -499,9 +559,47 @@ export const App = () => {
     return () => window.removeEventListener('resize', onResize);
   }, [image]);
 
+  useEffect(() => {
+    if (currentStep !== 'processing' || !imageElement || !roi || !calibration.pixelSize) {
+      setIsPreviewUpdating(false);
+      return undefined;
+    }
+
+    const requestId = analysisRequestIdRef.current + 1;
+    analysisRequestIdRef.current = requestId;
+    setIsPreviewUpdating(true);
+
+    const timeoutId = window.setTimeout(() => {
+      setStatus('即時辨識預覽更新中...');
+      requestAnimationFrame(() => {
+        if (analysisRequestIdRef.current !== requestId) return;
+        try {
+          const result = analyzeImage(imageElement, roi, settings, calibration);
+          if (analysisRequestIdRef.current !== requestId) return;
+          setAnalysisResult(result.particles, result.maskDataUrl, result.overlayDataUrl, { preserveExcluded: false });
+          setDisplayMode('overlay');
+          completeStep('processing');
+          setIsPreviewUpdating(false);
+          setStatus(`即時預覽：偵測到 ${result.particles.length} 顆粒子。`);
+        } catch (error) {
+          if (analysisRequestIdRef.current !== requestId) return;
+          setIsPreviewUpdating(false);
+          setStatus(error instanceof Error ? error.message : 'OpenCV 分析失敗。');
+        }
+      });
+    }, 180);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      analysisRequestIdRef.current += 1;
+    };
+  }, [calibration, completeStep, currentStep, imageElement, roi, setAnalysisResult, setDisplayMode, settings]);
+
   const draftROI = dragStart && draftPoint && toolMode === 'roi' ? normalizeRect(dragStart, draftPoint) : null;
+  const draftEraseRect = dragStart && draftPoint && toolMode === 'boxErase' ? normalizeRect(dragStart, draftPoint) : null;
   const draftLine = dragStart && draftPoint && toolMode === 'calibrate' ? [dragStart, draftPoint] : calibration.line;
   const activeStepLabel = workflowSteps.find((step) => step.id === currentStep)?.label ?? '';
+  const isReviewStep = currentStep === 'review';
 
   const stepPanel = (
     <section className="panel step-panel">
@@ -580,7 +678,7 @@ export const App = () => {
 
       {currentStep === 'processing' && (
         <>
-          <p className="step-hint">設定 threshold、粒子明暗與基本 morphology。完成後進入粒子辨識階段執行偵測。</p>
+          <p className="step-hint">調整 threshold、粒子明暗與 morphology，右側影像會自動更新粒子邊界。預覽穩定後即可進入手動刪除。</p>
           <label>
             <ParameterLabel help={helpText.threshold}>Threshold：{settings.threshold}</ParameterLabel>
             <input
@@ -641,16 +739,13 @@ export const App = () => {
               onChange={(event) => setSettings({ closingIterations: Number(event.target.value) })}
             />
           </label>
-        </>
-      )}
-
-      {currentStep === 'detection' && (
-        <>
-          <p className="step-hint">使用目前 ROI 與 threshold 設定執行粒子辨識。辨識完成後會自動進入手動刪除階段。</p>
-          <button className="primary" type="button" disabled={!imageElement || !roi} onClick={runAnalysis}>
-            開始粒子辨識
-          </button>
-          <p className="metric">{particles.length ? `已辨識 ${particles.length} 顆粒子` : '尚未執行辨識'}</p>
+          <p className="metric">
+            {isPreviewUpdating
+              ? '即時預覽更新中...'
+              : particles.length
+                ? `目前偵測到 ${particles.length} 顆粒子`
+                : '尚未偵測到粒子'}
+          </p>
         </>
       )}
 
@@ -702,7 +797,8 @@ export const App = () => {
   );
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${isReviewStep ? 'review-mode' : ''}`}>
+      {!isReviewStep && (
       <aside className="sidebar">
         <header>
           <h1>SEM 粒徑分析器</h1>
@@ -744,58 +840,51 @@ export const App = () => {
           </dl>
         </section>
 
-        <details className="panel advanced-panel">
-          <summary>進階工具</summary>
-          <div className="advanced-content">
-            <h2>工具</h2>
-            <div className="icon-grid">
-              {toolModes.map((mode) => {
-                const Icon = mode.icon;
-                return (
-                  <button
-                    key={mode.id}
-                    className={toolMode === mode.id ? 'active' : ''}
-                    onClick={() => setToolMode(mode.id)}
-                    title={mode.label}
-                    type="button"
-                  >
-                    <Icon size={18} />
-                  </button>
-                );
-              })}
-              <button type="button" onClick={fitToScreen} title="符合畫面">
-                <Maximize size={18} />
-              </button>
-            </div>
-            <h2>顯示模式</h2>
-            <div className="segmented">
-              {displayModes.map((mode) => (
-                <button
-                  key={mode.id}
-                  type="button"
-                  className={displayMode === mode.id ? 'active' : ''}
-                  onClick={() => setDisplayMode(mode.id)}
-                >
-                  {mode.label}
-                </button>
-              ))}
-            </div>
-            <label>
-              <ParameterLabel help={helpText.overlayOpacity}>疊圖透明度：{Math.round(settings.overlayOpacity * 100)}%</ParameterLabel>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.05"
-                value={settings.overlayOpacity}
-                onChange={(event) => setSettings({ overlayOpacity: Number(event.target.value) })}
-              />
-            </label>
-          </div>
-        </details>
       </aside>
+      )}
 
-      <section className="workspace">
+      {isReviewStep && (
+        <section className="review-toolbar" aria-label="手動刪除工具列">
+          <div className="review-toolbar-status">
+            <strong>手動刪除</strong>
+            <span>
+              總數 {summary.total} / 有效 {summary.valid} / 排除 {excludedCount}
+            </span>
+          </div>
+          <div className="review-toolbar-actions">
+            <button type="button" onClick={goBack}>
+              <ChevronLeft size={16} />
+              上一步
+            </button>
+            <button type="button" disabled={!undoStack.length} onClick={undo} title="Undo">
+              <Undo2 size={16} />
+              Undo
+            </button>
+            <button type="button" disabled={!redoStack.length} onClick={redo} title="Redo">
+              <Redo2 size={16} />
+              Redo
+            </button>
+            <label className="checkbox-line compact-checkbox">
+              <input type="checkbox" checked={showExcluded} onChange={(event) => setShowExcluded(event.target.checked)} />
+              顯示排除
+            </label>
+            <button type="button" disabled={!particles.length} onClick={() => downloadCSV(particles)}>
+              <FileDown size={16} />
+              下載 CSV
+            </button>
+            <button
+              type="button"
+              disabled={!imageElement || !particles.length}
+              onClick={() => imageElement && downloadOverlayPNG(imageElement, particles, calibration)}
+            >
+              <Download size={16} />
+              下載 PNG
+            </button>
+          </div>
+        </section>
+      )}
+
+      <section className={`workspace ${isReviewStep ? 'with-results' : 'preview-only'}`}>
         <div
           ref={stageRef}
           className="stage"
@@ -806,9 +895,65 @@ export const App = () => {
             setIsDragging(false);
             setDragStart(null);
             setDraftPoint(null);
+            setErasePath([]);
           }}
           onWheel={handleWheel}
         >
+          <div
+            className="stage-toolbar"
+            onPointerDown={(event) => event.stopPropagation()}
+            onPointerMove={(event) => event.stopPropagation()}
+            onPointerUp={(event) => event.stopPropagation()}
+            onWheel={(event) => event.stopPropagation()}
+          >
+            <div className="stage-tool-row">
+              {stageToolModes.map((mode) => {
+                const Icon = mode.icon;
+                const disabled =
+                  !image ||
+                  ((mode.id === 'erase' || mode.id === 'boxErase' || mode.id === 'select') && !particles.length);
+                return (
+                  <button
+                    key={mode.id}
+                    className={toolMode === mode.id ? 'active' : ''}
+                    disabled={disabled}
+                    onClick={() => setToolMode(mode.id)}
+                    title={mode.label}
+                    type="button"
+                  >
+                    <Icon size={18} />
+                  </button>
+                );
+              })}
+              <button type="button" disabled={!image} onClick={fitToScreen} title="符合畫面">
+                <Maximize size={18} />
+              </button>
+            </div>
+            <div className="stage-mode-row">
+              {displayModes.map((mode) => (
+                <button
+                  key={mode.id}
+                  type="button"
+                  className={displayMode === mode.id ? 'active' : ''}
+                  disabled={!image}
+                  onClick={() => setDisplayMode(mode.id)}
+                >
+                  {mode.label}
+                </button>
+              ))}
+            </div>
+            <label className="stage-opacity-control">
+              <ParameterLabel help={helpText.overlayOpacity}>疊圖 {Math.round(settings.overlayOpacity * 100)}%</ParameterLabel>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={settings.overlayOpacity}
+                onChange={(event) => setSettings({ overlayOpacity: Number(event.target.value) })}
+              />
+            </label>
+          </div>
           {!image && <div className="empty-state">上傳 SEM 影像後即可開始校正與分析</div>}
           {image && (
             <div
@@ -828,6 +973,15 @@ export const App = () => {
                     y={(draftROI ?? roi)!.y}
                     width={(draftROI ?? roi)!.width}
                     height={(draftROI ?? roi)!.height}
+                  />
+                )}
+                {draftEraseRect && (
+                  <rect
+                    className="eraser-rect"
+                    x={draftEraseRect.x}
+                    y={draftEraseRect.y}
+                    width={draftEraseRect.width}
+                    height={draftEraseRect.height}
                   />
                 )}
                 {draftLine && (
@@ -859,12 +1013,13 @@ export const App = () => {
           )}
         </div>
 
+        {isReviewStep ? (
         <div className="results">
           <section className="diameter-summary" aria-label="粒徑統計">
             <div className="results-heading">
               <div>
                 <span>粒徑統計</span>
-                <h2>有效實際粒徑分布</h2>
+                <h2>有效長軸粒徑分布</h2>
               </div>
               <label className="bin-control">
                 <ParameterLabel help={helpText.binWidth}>
@@ -958,7 +1113,7 @@ export const App = () => {
               </>
             ) : (
               <div className="stats-empty">
-                {particles.length ? '目前沒有有效實際粒徑。請確認比例尺或恢復至少一顆有效粒子。' : '完成粒子辨識後，這裡會顯示粒徑分布與統計。'}
+                {particles.length ? '目前沒有有效長軸粒徑。請確認比例尺或恢復至少一顆有效粒子。' : '完成即時預覽後，這裡會顯示長軸粒徑分布與統計。'}
               </div>
             )}
           </section>
@@ -971,7 +1126,7 @@ export const App = () => {
                   <tr>
                     <SortableHead label="ID" sortKey="id" current={sortKey} direction={sortDirection} onSort={setSort} />
                     <SortableHead label="Area" sortKey="area" current={sortKey} direction={sortDirection} onSort={setSort} />
-                    <SortableHead label="Equivalent diameter" sortKey="diameter" current={sortKey} direction={sortDirection} onSort={setSort} />
+                    <SortableHead label="Long-axis diameter" sortKey="diameter" current={sortKey} direction={sortDirection} onSort={setSort} />
                     <th>Centroid X</th>
                     <th>Centroid Y</th>
                     <th>Status</th>
@@ -987,9 +1142,9 @@ export const App = () => {
                       <td>{particle.id}</td>
                       <td>{particle.areaPx2.toFixed(1)}</td>
                       <td>
-                        {particle.equivalentDiameterPx.toFixed(2)} px
-                        {particle.equivalentDiameterActual !== null
-                          ? ` / ${particle.equivalentDiameterActual.toFixed(2)} ${calibration.unit}`
+                        {particle.diameterPx.toFixed(2)} px
+                        {particle.diameterActual !== null
+                          ? ` / ${particle.diameterActual.toFixed(2)} ${calibration.unit}`
                           : ''}
                       </td>
                       <td>{particle.centroidX.toFixed(1)}</td>
@@ -1002,6 +1157,19 @@ export const App = () => {
             </div>
           </details>
         </div>
+        ) : (
+          <div className="preview-strip">
+            <span>
+              {currentStep === 'processing'
+                ? isPreviewUpdating
+                  ? '即時辨識預覽更新中...'
+                  : particles.length
+                    ? `即時辨識預覽：${particles.length} 顆粒子，右側輪廓會跟著參數更新`
+                    : '調整 threshold 與 morphology 後，右側會顯示即時粒子邊界'
+                : status}
+            </span>
+          </div>
+        )}
       </section>
     </main>
   );
@@ -1019,14 +1187,51 @@ const ParameterLabel = ({ children, help }: ParameterLabelProps) => (
   </span>
 );
 
-const HelpTip = ({ text }: { text: string }) => (
-  <span className="help-tip" tabIndex={0} aria-label={text}>
-    ?
-    <span className="help-tooltip" role="tooltip">
-      {text}
+const HelpTip = ({ text }: { text: string }) => {
+  const triggerRef = useRef<HTMLSpanElement>(null);
+  const [tooltip, setTooltip] = useState<{ left: number; top: number; width: number; placement: 'top' | 'bottom' } | null>(
+    null,
+  );
+
+  const showTooltip = () => {
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const margin = 12;
+    const width = Math.min(280, window.innerWidth - margin * 2);
+    const left = Math.min(window.innerWidth - margin - width / 2, Math.max(margin + width / 2, rect.left + rect.width / 2));
+    const placement = rect.top < 150 ? 'bottom' : 'top';
+    setTooltip({
+      left,
+      top: placement === 'bottom' ? rect.bottom + 10 : rect.top - 10,
+      width,
+      placement,
+    });
+  };
+
+  return (
+    <span
+      ref={triggerRef}
+      className="help-tip"
+      tabIndex={0}
+      aria-label={text}
+      onBlur={() => setTooltip(null)}
+      onFocus={showTooltip}
+      onMouseEnter={showTooltip}
+      onMouseLeave={() => setTooltip(null)}
+    >
+      ?
+      {tooltip && (
+        <span
+          className={`help-tooltip visible ${tooltip.placement}`}
+          role="tooltip"
+          style={{ left: tooltip.left, top: tooltip.top, width: tooltip.width }}
+        >
+          {text}
+        </span>
+      )}
     </span>
-  </span>
-);
+  );
+};
 
 interface SortableHeadProps {
   label: string;

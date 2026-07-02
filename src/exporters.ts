@@ -7,8 +7,8 @@ export const downloadCSV = (particles: Particle[]) => {
     'particle_id',
     'area_px2',
     'area_actual',
-    'equivalent_diameter_px',
-    'equivalent_diameter_actual',
+    'diameter_px',
+    'diameter_actual',
     'centroid_x',
     'centroid_y',
     'excluded',
@@ -17,8 +17,8 @@ export const downloadCSV = (particles: Particle[]) => {
     particle.id,
     formatNumber(particle.areaPx2),
     formatNumber(particle.areaActual),
-    formatNumber(particle.equivalentDiameterPx),
-    formatNumber(particle.equivalentDiameterActual),
+    formatNumber(particle.diameterPx),
+    formatNumber(particle.diameterActual),
     formatNumber(particle.centroidX),
     formatNumber(particle.centroidY),
     particle.excluded ? 'true' : 'false',
@@ -41,7 +41,7 @@ export const downloadOverlayPNG = (image: HTMLImageElement, particles: Particle[
   const context = canvas.getContext('2d');
   if (!context) return;
   context.drawImage(image, 0, 0);
-  context.lineWidth = Math.max(2, Math.round(Math.min(canvas.width, canvas.height) / 600));
+  context.lineWidth = Math.max(3, Math.round(Math.min(canvas.width, canvas.height) / 450));
   context.strokeStyle = '#1cd397';
   particles
     .filter((particle) => !particle.excluded)
